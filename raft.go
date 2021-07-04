@@ -91,6 +91,7 @@ type leaderState struct {
 }
 
 // setLeader is used to modify the current leader of the cluster
+// TODO: 这个会导致每次写数据操作都会上锁，可以加读写锁加速
 func (r *Raft) setLeader(leader ServerAddress) {
 	r.leaderLock.Lock()
 	oldLeader := r.leader
@@ -163,56 +164,73 @@ func (r *Raft) runFollower() {
 			// Reject any operations since we are not the leader
 			c.respond(ErrNotLeader)
 
+		// !!! apply用来做一些操作，具体理解下来就是写操作
 		case a := <-r.applyCh:
 			// Reject any operations since we are not the leader
 			a.respond(ErrNotLeader)
 
+		// !!! 校验是否仍然是leader，暂时不清楚是什么场景下用。
 		case v := <-r.verifyCh:
 			// Reject any operations since we are not the leader
 			v.respond(ErrNotLeader)
 
+		// !!! 用户选中重启服务
 		case r := <-r.userRestoreCh:
 			// Reject any restores since we are not the leader
 			r.respond(ErrNotLeader)
 
+		// !!! 类似控制面板上发起重新选举leader
 		case r := <-r.leadershipTransferCh:
 			// Reject any operations since we are not the leader
 			r.respond(ErrNotLeader)
 
+		// !!! 获取配置？没搞懂，后面关注具体场景
 		case c := <-r.configurationsCh:
 			c.configurations = r.configurations.Clone()
 			c.respond(nil)
 
+		// !!! 重启，看起来是热重启
 		case b := <-r.bootstrapCh:
 			b.respond(r.liveBootstrap(b.configuration))
 
+		// !!! 心跳定时到了，会有一个随机回避，走到这里说明超时了，可能需要发起选举了。
 		case <-heartbeatTimer:
 			// Restart the heartbeat timer
 			hbTimeout := r.config().HeartbeatTimeout
 			heartbeatTimer = randomTimeout(hbTimeout)
 
 			// Check if we have had a successful contact
+			// 如果发现在超时周期内leader有联系过当前节点，说明没问题，本环节只重置定时器，就行转。
 			lastContact := r.LastContact()
 			if time.Now().Sub(lastContact) < hbTimeout {
 				continue
 			}
 
+			// !!! 到这里，说明真的timeout了，要开始考虑后续的行为了
+
 			// Heartbeat failed! Transition to the candidate state
+
+			// 记录之前的leader，然后重置掉
 			lastLeader := r.Leader()
 			r.setLeader("")
 
+			// 首次
 			if r.configurations.latestIndex == 0 {
 				if !didWarn {
 					r.logger.Warn("no known peers, aborting election")
 					didWarn = true
 				}
+				// !!! 这里有个latestIndex和comitedIndex的概念
 			} else if r.configurations.latestIndex == r.configurations.committedIndex &&
+				// 没有投票权
 				!hasVote(r.configurations.latest, r.localID) {
 				if !didWarn {
 					r.logger.Warn("not part of stable configuration, aborting election")
 					didWarn = true
 				}
-			} else {
+			} else { // 实际上这里有两种可能：
+				// 1. 最新的index跟commitedIndex不一致。
+				// 2. 有投票权。
 				r.logger.Warn("heartbeat timeout reached, starting election", "last-leader", lastLeader)
 				metrics.IncrCounter([]string{"raft", "transition", "heartbeat_timeout"}, 1)
 				r.setState(Candidate)
@@ -253,6 +271,8 @@ func (r *Raft) runCandidate() {
 	metrics.IncrCounter([]string{"raft", "state", "candidate"}, 1)
 
 	// Start vote for us, and set a timeout
+	// 启动的时候就先发起一下自己的选举
+	// ! voteCh里面包含了投票人给自己的反馈
 	voteCh := r.electSelf()
 
 	// Make sure the leadership transfer flag is reset after each run. Having this
@@ -269,6 +289,7 @@ func (r *Raft) runCandidate() {
 	votesNeeded := r.quorumSize()
 	r.logger.Debug("votes", "needed", votesNeeded)
 
+	// ? 一旦选成功了就退出循环了？
 	for r.getState() == Candidate {
 		select {
 		case rpc := <-r.rpcCh:
@@ -1234,9 +1255,9 @@ func (r *Raft) processRPC(rpc RPC) {
 	}
 
 	switch cmd := rpc.Command.(type) {
-	case *AppendEntriesRequest:
+	case *AppendEntriesRequest: // ! 有数据请求进来了
 		r.appendEntries(rpc, cmd)
-	case *RequestVoteRequest:
+	case *RequestVoteRequest: // ! 有发起投票的了。
 		r.requestVote(rpc, cmd)
 	case *InstallSnapshotRequest:
 		r.installSnapshot(rpc, cmd)
@@ -1290,12 +1311,14 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 	}()
 
 	// Ignore an older term
+	// 对方已经过时了，直接忽略
 	if a.Term < r.getCurrentTerm() {
 		return
 	}
 
 	// Increase the term if we see a newer one, also transition to follower
 	// if we ever get an appendEntries call
+	// 自己已经过时了，自动降级到follwer。
 	if a.Term > r.getCurrentTerm() || r.getState() != Follower {
 		// Ensure transition to follower
 		r.setState(Follower)
@@ -1303,18 +1326,28 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 		resp.Term = a.Term
 	}
 
+	// ! 到这里检查得差不多了，准备开始写数据了，先确保自己的leader指向目标
 	// Save the current leader
+	// TODO 改写setLeader，换读写锁，提高性能
 	r.setLeader(r.trans.DecodePeer(a.Leader))
 
 	// Verify the last log entry
+	// 发的消息里带上上一个entry的信息
 	if a.PrevLogEntry > 0 {
+		// lastIdx: 当前的node里记录的上次的index
+		// lastTerm: 当前node里记录的上次的term
 		lastIdx, lastTerm := r.getLastEntry()
 
 		var prevLogTerm uint64
+		// ! 请求里上次的index和raft里记录的上次的index相同，这时候上个日志的term以请求内的为准。
+		// ? 这块不是很理解。
+		// ! 从目前来看，这一块逻辑如下：
+		// * 请求里本身会携带index和term值。如果index和node当前的last entry的index的一致，可以用getLastEntry快速获取。如果是发现携带的
+		// * term已经不是最新的，就要从log存储里拿。不管怎么样，prevLogTerm是取的请求里的index对应的那个term。
 		if a.PrevLogEntry == lastIdx {
 			prevLogTerm = lastTerm
-
-		} else {
+		} else { // ? 这个不会是问题么？
+			// 如果上一个entry有差异
 			var prevLog Log
 			if err := r.logs.GetLog(a.PrevLogEntry, &prevLog); err != nil {
 				r.logger.Warn("failed to get previous log",
@@ -1327,14 +1360,18 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 			prevLogTerm = prevLog.Term
 		}
 
+		// 发现请求里的term和node里存储的term不一致，肯定是出问题了，重试解决不了问题。
 		if a.PrevLogTerm != prevLogTerm {
 			r.logger.Warn("previous log term mis-match",
 				"ours", prevLogTerm,
 				"remote", a.PrevLogTerm)
+			// ! 标识是没法重试解决的错误。
 			resp.NoRetryBackoff = true
 			return
 		}
 	}
+
+	// * 检查通过了，可以开始干活了
 
 	// Process any new entries
 	if len(a.Entries) > 0 {
@@ -1344,25 +1381,38 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 		lastLogIdx, _ := r.getLastLog()
 		var newEntries []*Log
 		for i, entry := range a.Entries {
+			// ! 找到第一个更新的entry，从此以后的都是需要插入的。潜在的前提是entry是有序的。
 			if entry.Index > lastLogIdx {
 				newEntries = a.Entries[i:]
 				break
 			}
+
+			// ! 这里的都是重复的，检查一下是否有冲突
+
 			var storeEntry Log
+
+			// 网络问题
 			if err := r.logs.GetLog(entry.Index, &storeEntry); err != nil {
 				r.logger.Warn("failed to get log entry",
 					"index", entry.Index,
 					"error", err)
 				return
 			}
+
+			// term不对
 			if entry.Term != storeEntry.Term {
 				r.logger.Warn("clearing log suffix",
 					"from", entry.Index,
 					"to", lastLogIdx)
+
+				// ? 以进来的为准，删除本地的，为啥要删除本地的。。。
 				if err := r.logs.DeleteRange(entry.Index, lastLogIdx); err != nil {
 					r.logger.Error("failed to clear log suffix", "error", err)
 					return
 				}
+
+				// // entry比较老，删除数据，但是把index拉到commitedIndex，后面会自动触发追平。
+				// ! 这里实际上是出现了不一致的时候以下发的数据为准
 				if entry.Index <= r.configurations.latestIndex {
 					r.setLatestConfiguration(r.configurations.committed, r.configurations.committedIndex)
 				}
@@ -1371,8 +1421,10 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 			}
 		}
 
+		// newEntries包含了本次的所有新数据
 		if n := len(newEntries); n > 0 {
 			// Append the new entries
+			// 存储新数据
 			if err := r.logs.StoreLogs(newEntries); err != nil {
 				r.logger.Error("failed to append to logs", "error", err)
 				// TODO: leaving r.getLastLog() in the wrong
@@ -1420,6 +1472,7 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 // processConfigurationLogEntry takes a log entry and updates the latest
 // configuration if the entry results in a new configuration. This must only be
 // called from the main thread, or from NewRaft() before any threads have begun.
+// * 专门用来处理配置类entry
 func (r *Raft) processConfigurationLogEntry(entry *Log) error {
 	switch entry.Type {
 	case LogConfiguration:
@@ -1438,6 +1491,7 @@ func (r *Raft) processConfigurationLogEntry(entry *Log) error {
 }
 
 // requestVote is invoked when we get an request vote RPC call.
+// 收到投票请求了
 func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 	defer metrics.MeasureSince([]string{"raft", "rpc", "requestVote"}, time.Now())
 	r.observe(*req)
@@ -1463,6 +1517,12 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 	// check the LeadershipTransfer flag is set. Usually votes are rejected if
 	// there is a known leader. But if the leader initiated a leadership transfer,
 	// vote!
+	// 如果有leader，直接拒绝掉，这可以避免掉两拨人都来发vote，举例如下：
+	/*
+	* 节点有: A,B,C,D,E
+	* 节点A发起投票，A,B,C同意；在B投票以后，D又发起了，这时候B不应该再响应了，应该直接拒绝。
+	 */
+	// * 1. 当前节点有leader，并且leader并没有标识要转移，拒绝。
 	candidate := r.trans.DecodePeer(req.Candidate)
 	if leader := r.Leader(); leader != "" && leader != candidate && !req.LeadershipTransfer {
 		r.logger.Warn("rejecting vote request since we have a leader",
@@ -1472,11 +1532,15 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 	}
 
 	// Ignore an older term
+	// 比当前iterm更小的，直接拒绝
+	// * 2. 如果term太小，说明发起者信息不是最新的，直接拒绝。
 	if req.Term < r.getCurrentTerm() {
 		return
 	}
 
 	// Increase the term if we see a newer one
+	// 如果有更新的iterm，直接切换成follower，没投票权了。
+	// * 3. 如果有更大term的进来，说明当前节点有延迟了，自动降级，拒绝。
 	if req.Term > r.getCurrentTerm() {
 		// Ensure transition to follower
 		r.logger.Debug("lost leadership because received a requestVote with a newer term")
@@ -1487,10 +1551,12 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 
 	// Check if we have voted yet
 	lastVoteTerm, err := r.stable.GetUint64(keyLastVoteTerm)
+	// * 4. 网络错误，拒绝。
 	if err != nil && err.Error() != "not found" {
 		r.logger.Error("failed to get last vote term", "error", err)
 		return
 	}
+	// * 5. 网络错误，拒绝。
 	lastVoteCandBytes, err := r.stable.Get(keyLastVoteCand)
 	if err != nil && err.Error() != "not found" {
 		r.logger.Error("failed to get last vote candidate", "error", err)
@@ -1498,16 +1564,21 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 	}
 
 	// Check if we've voted in this election before
+	// 之前已经vote过了，并且有记录，如果完全一致，通过申请。
+	// ? 这个是为了啥？网络问题？重试？
 	if lastVoteTerm == req.Term && lastVoteCandBytes != nil {
 		r.logger.Info("duplicate requestVote for same term", "term", req.Term)
+		// 如果有不一致，直接拒绝掉，因为已经选了其他人了。
 		if bytes.Compare(lastVoteCandBytes, req.Candidate) == 0 {
 			r.logger.Warn("duplicate requestVote from", "candidate", candidate)
 			resp.Granted = true
 		}
+		// * 6. 已经选过了，但是选的是其他人，拒绝。
 		return
 	}
 
 	// Reject if their term is older
+	// * 7. term正常，但是发起方的数据太老了，拒绝。
 	lastIdx, lastTerm := r.getLastEntry()
 	if lastTerm > req.LastLogTerm {
 		r.logger.Warn("rejecting vote request since our last term is greater",
@@ -1517,6 +1588,7 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 		return
 	}
 
+	// * 8. term和数据都正常，但是发起方的log太老了，拒绝。
 	if lastTerm == req.LastLogTerm && lastIdx > req.LastLogIndex {
 		r.logger.Warn("rejecting vote request since our last index is greater",
 			"candidate", candidate,
@@ -1526,6 +1598,7 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 	}
 
 	// Persist a vote for safety
+	// * 所有条件都满足了，通过。
 	if err := r.persistVote(req.Term, req.Candidate); err != nil {
 		r.logger.Error("failed to persist vote", "error", err)
 		return
@@ -1720,7 +1793,9 @@ func (r *Raft) electSelf() <-chan *voteResult {
 
 	// For each peer, request a vote
 	for _, server := range r.configurations.latest.Servers {
+		// 给所有的投票者发消息
 		if server.Suffrage == Voter {
+			// 自己持久化一下，标识自己一定会给自己投票
 			if server.ID == r.localID {
 				// Persist a vote for ourselves
 				if err := r.persistVote(req.Term, req.Candidate); err != nil {
@@ -1728,6 +1803,7 @@ func (r *Raft) electSelf() <-chan *voteResult {
 					return nil
 				}
 				// Include our own vote
+				// !!! 正好可以表征同意的时候response格式
 				respCh <- &voteResult{
 					RequestVoteResponse: RequestVoteResponse{
 						RPCHeader: r.getRPCHeader(),

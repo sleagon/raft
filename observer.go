@@ -112,6 +112,7 @@ func (r *Raft) DeregisterObserver(or *Observer) {
 }
 
 // observe sends an observation to every observer.
+// 类似hook的概念，有变更了会收到这个消息，会有同步和异步两种情况，异步会有消息丢弃
 func (r *Raft) observe(o interface{}) {
 	// In general observers should not block. But in any case this isn't
 	// disastrous as we only hold a read lock, which merely prevents

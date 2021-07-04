@@ -3,6 +3,11 @@ package raft
 import "fmt"
 
 // ServerSuffrage determines whether a Server in a Configuration gets a vote.
+// 总共有三种类型
+// 1. 投票者
+// 2. 非投票者
+// 3. 正在追日志
+// ??? 暂时还不清楚这个定义和learner/follower/leader有没有关系。
 type ServerSuffrage int
 
 // Note: Don't renumber these, since the numbers are written into the log.
@@ -129,6 +134,11 @@ type configurationChangeRequest struct {
 	prevIndex uint64
 }
 
+/*
+!!! 在 Diego Ongaro 的论文里，uncommitted的index最多能比commited大一个，这个是个前提，
+!!! 不然无法保证新的候选人提交的晋升申请的ID会单调递增。
+这里的configuration的结构类似链表，需要看一下怎么清理的。
+*/
 // configurations is state tracked on every server about its Configurations.
 // Note that, per Diego's dissertation, there can be at most one uncommitted
 // configuration at a time (the next configuration may not be created until the

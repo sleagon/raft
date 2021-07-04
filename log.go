@@ -8,6 +8,7 @@ import (
 )
 
 // LogType describes various types of log entries.
+// 所有的log类型
 type LogType uint8
 
 const (

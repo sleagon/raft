@@ -2,6 +2,7 @@ package raft
 
 // StableStore is used to provide stable storage
 // of key configurations to ensure safety.
+// StableStore提供的是稳定数据的存储，需要保证稳定存储以后可以稳定取出。
 type StableStore interface {
 	Set(key []byte, val []byte) error
 

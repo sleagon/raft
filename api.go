@@ -125,6 +125,8 @@ type Raft struct {
 	// candidate because the leader tries to transfer leadership. This flag is
 	// used in RequestVoteRequest to express that a leadership transfer is going
 	// on.
+	// ! 这个标记是用来表征是不是leader主动发起的转移leader的操作，如果是leader发起的，即便是有leader，下游依然会投票同意。
+	// ! 这个内容并不在raft的标准协议内。
 	candidateFromLeadershipTransfer bool
 
 	// Stores our local server ID, used to avoid sending RPCs to ourself
@@ -478,6 +480,7 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 	}
 
 	// Try to restore the current term.
+	// store提供了稳定的存储保存不同key的值，keyCurrentTerm 对应的是当前的item值，保证全局一致。
 	currentTerm, err := stable.GetUint64(keyCurrentTerm)
 	if err != nil && err.Error() != "not found" {
 		return nil, fmt.Errorf("failed to load current term: %v", err)
